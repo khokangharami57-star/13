@@ -1,0 +1,288 @@
+<!DOCTYPE html>
+<html lang="bn">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+<title>স্পেস শুটার</title>
+<style>
+  :root { --bg:#020617; --text:#f1f5f9; --accent:#38bdf8; }
+  * { box-sizing:border-box; -webkit-tap-highlight-color:transparent; }
+  html,body { margin:0; height:100%; background:var(--bg); color:var(--text);
+    font-family:system-ui,-apple-system,"Noto Sans Bengali",sans-serif; touch-action:none; user-select:none; overflow:hidden; }
+  body { display:flex; flex-direction:column; align-items:center; justify-content:center; padding:8px; gap:8px; }
+  .bar { display:flex; gap:18px; font-size:16px; width:100%; max-width:360px; justify-content:space-between; }
+  .bar b { color:var(--accent); }
+  #wrap { position:relative; width:100%; max-width:360px; }
+  canvas { width:100%; display:block; background:linear-gradient(#020617,#0f172a); border-radius:12px; border:2px solid #1e293b; touch-action:none; }
+  #overlay { position:absolute; inset:0; display:flex; flex-direction:column; align-items:center;
+    justify-content:center; gap:12px; background:rgba(2,6,23,.88); border-radius:12px; text-align:center; padding:14px; }
+  button { background:var(--accent); color:#082f49; border:0; border-radius:12px; font-size:18px; font-weight:700; padding:10px 26px; }
+  .hint { font-size:13px; color:#94a3b8; }
+</style>
+</head>
+<body>
+<div class="bar">
+  <div>স্কোর: <b id="score">0</b></div>
+  <div>জীবন: <b id="lives">3</b></div>
+  <div>সেরা: <b id="best">0</b></div>
+</div>
+<div id="wrap">
+  <canvas id="c" width="360" height="560"></canvas>
+  <div id="overlay">
+    <div style="font-size:42px">🚀</div>
+    <div id="msg" style="font-size:19px;line-height:1.5">স্পেস শুটার<br>আঙুল দিয়ে জাহাজ সরাও, নিজে নিজে গুলি চলবে।<br>উল্কা ও শত্রু ধ্বংস করো!</div>
+    <button id="start">খেলা শুরু</button>
+    <div class="hint">কিবোর্ডে ← → বা মাউস দিয়েও খেলা যায়</div>
+  </div>
+</div>
+
+<script>
+(function(){
+  const cv = document.getElementById('c'), ctx = cv.getContext('2d');
+  const W = cv.width, H = cv.height;
+  const scoreEl = document.getElementById('score'), livesEl = document.getElementById('lives'), bestEl = document.getElementById('best');
+  const overlay = document.getElementById('overlay'), msg = document.getElementById('msg'), startBtn = document.getElementById('start');
+
+  let best = 0;
+  try { best = parseInt(localStorage.getItem('spaceBest')) || 0; } catch(e) {}
+  bestEl.textContent = best;
+
+  let player, bullets, enemies, particles, stars, powerups;
+  let score, lives, running = false, last = 0, spawnT, fireT, level, tx = null, keys = {}, shake = 0;
+
+  stars = Array.from({length:60}, () => ({x:Math.random()*W, y:Math.random()*H, s:Math.random()*2+.5, v:Math.random()*40+20}));
+
+  let actx;
+  function beep(f, t, type, vol){
+    try {
+      actx = actx || new (window.AudioContext || window.webkitAudioContext)();
+      const o = actx.createOscillator(), g = actx.createGain();
+      o.type = type || 'square'; o.frequency.value = f;
+      g.gain.value = vol || .04;
+      g.gain.exponentialRampToValueAtTime(.0001, actx.currentTime + t);
+      o.connect(g); g.connect(actx.destination);
+      o.start(); o.stop(actx.currentTime + t);
+    } catch(e) {}
+  }
+
+  function reset(){
+    player = {x:W/2, y:H-70, w:34, h:40, inv:0, power:0};
+    bullets = []; enemies = []; particles = []; powerups = [];
+    score = 0; lives = 3; level = 1; spawnT = 0; fireT = 0; tx = null;
+    scoreEl.textContent = 0; livesEl.textContent = 3;
+  }
+
+  function spawn(){
+    const r = Math.random();
+    const size = 20 + Math.random()*22;
+    if (r < .25 + Math.min(level*.03, .25)) {
+      enemies.push({type:'ship', x:Math.random()*(W-40)+20, y:-30, w:30, h:28, hp:2, vx:(Math.random()-.5)*60, vy:70+level*8, t:0, fire:1+Math.random()*2});
+    } else {
+      enemies.push({type:'rock', x:Math.random()*(W-size)+size/2, y:-size, w:size, h:size, hp:Math.ceil(size/18), vx:(Math.random()-.5)*50, vy:70+Math.random()*70+level*10, rot:0, rv:(Math.random()-.5)*3});
+    }
+  }
+
+  function boom(x, y, color, n){
+    for (let i=0;i<n;i++){
+      const a = Math.random()*6.28, s = Math.random()*140+30;
+      particles.push({x, y, vx:Math.cos(a)*s, vy:Math.sin(a)*s, life:.6+Math.random()*.4, c:color});
+    }
+  }
+
+  function hit(a, b){
+    return Math.abs(a.x-b.x) < (a.w+b.w)/2*.8 && Math.abs(a.y-b.y) < (a.h+b.h)/2*.8;
+  }
+
+  function loseLife(){
+    if (player.inv > 0) return;
+    lives--; livesEl.textContent = lives;
+    player.inv = 2; shake = .3;
+    boom(player.x, player.y, '#f87171', 25);
+    beep(120, .4, 'sawtooth', .08);
+    if (lives <= 0) gameOver();
+  }
+
+  function update(dt){
+    // movement
+    if (keys.ArrowLeft || keys.a) player.x -= 320*dt;
+    if (keys.ArrowRight || keys.d) player.x += 320*dt;
+    if (tx !== null) player.x += (tx - player.x) * Math.min(1, dt*14);
+    player.x = Math.max(player.w/2, Math.min(W-player.w/2, player.x));
+    if (player.inv > 0) player.inv -= dt;
+    if (player.power > 0) player.power -= dt;
+    if (shake > 0) shake -= dt;
+
+    // auto fire
+    fireT -= dt;
+    if (fireT <= 0) {
+      fireT = player.power > 0 ? .13 : .24;
+      bullets.push({x:player.x, y:player.y-22, vy:-520, own:true});
+      if (player.power > 0) {
+        bullets.push({x:player.x-12, y:player.y-14, vy:-520, own:true});
+        bullets.push({x:player.x+12, y:player.y-14, vy:-520, own:true});
+      }
+      beep(880, .05, 'square', .015);
+    }
+
+    // spawn
+    spawnT -= dt;
+    if (spawnT <= 0) { spawn(); spawnT = Math.max(.35, 1.1 - level*.07); }
+
+    // bullets
+    bullets.forEach(b => b.y += b.vy*dt);
+    bullets = bullets.filter(b => b.y > -20 && b.y < H+20);
+
+    // enemies
+    enemies.forEach(e => {
+      e.x += e.vx*dt; e.y += e.vy*dt;
+      if (e.x < e.w/2 || e.x > W-e.w/2) e.vx *= -1;
+      if (e.type === 'rock') e.rot += e.rv*dt;
+      if (e.type === 'ship') {
+        e.t += dt; e.fire -= dt;
+        e.x += Math.sin(e.t*3)*40*dt;
+        if (e.fire <= 0 && e.y > 0) {
+          e.fire = 1.5 + Math.random()*1.5;
+          bullets.push({x:e.x, y:e.y+16, vy:230, own:false});
+        }
+      }
+    });
+
+    // bullet vs enemy
+    bullets.forEach(b => {
+      if (!b.own) return;
+      enemies.forEach(e => {
+        if (b.dead || e.dead) return;
+        if (Math.abs(b.x-e.x) < e.w/2 && Math.abs(b.y-e.y) < e.h/2) {
+          b.dead = true; e.hp--;
+          boom(b.x, b.y, '#fde68a', 4);
+          if (e.hp <= 0) {
+            e.dead = true;
+            score += e.type==='ship' ? 30 : 10;
+            scoreEl.textContent = score;
+            boom(e.x, e.y, e.type==='ship' ? '#f472b6' : '#a8a29e', 14);
+            beep(200, .15, 'sawtooth', .05);
+            if (Math.random() < .1) powerups.push({x:e.x, y:e.y, w:22, h:22, vy:90});
+            const nl = 1 + Math.floor(score/150);
+            if (nl > level) level = nl;
+          }
+        }
+      });
+    });
+
+    // hits on player
+    bullets.forEach(b => {
+      if (!b.own && !b.dead && Math.abs(b.x-player.x) < 16 && Math.abs(b.y-player.y) < 18) { b.dead = true; loseLife(); }
+    });
+    enemies.forEach(e => {
+      if (!e.dead && hit(e, player)) { e.dead = true; boom(e.x, e.y, '#fb923c', 14); loseLife(); }
+    });
+
+    // powerups
+    powerups.forEach(p => {
+      p.y += p.vy*dt;
+      if (hit(p, player)) { p.dead = true; player.power = 8; beep(1000, .15, 'sine', .06); }
+    });
+
+    bullets = bullets.filter(b => !b.dead);
+    enemies = enemies.filter(e => !e.dead && e.y < H+50);
+    powerups = powerups.filter(p => !p.dead && p.y < H+30);
+
+    // particles
+    particles.forEach(p => { p.x += p.vx*dt; p.y += p.vy*dt; p.life -= dt; });
+    particles = particles.filter(p => p.life > 0);
+    stars.forEach(s => { s.y += s.v*dt; if (s.y > H) { s.y = 0; s.x = Math.random()*W; } });
+  }
+
+  function drawShip(x, y, color, flip){
+    ctx.save(); ctx.translate(x, y); if (flip) ctx.scale(1, -1);
+    ctx.fillStyle = color;
+    ctx.beginPath(); ctx.moveTo(0,-20); ctx.lineTo(16,18); ctx.lineTo(0,10); ctx.lineTo(-16,18); ctx.closePath(); ctx.fill();
+    ctx.fillStyle = '#e0f2fe'; ctx.beginPath(); ctx.arc(0,0,4,0,7); ctx.fill();
+    ctx.restore();
+  }
+
+  function draw(){
+    ctx.save();
+    if (shake > 0) ctx.translate((Math.random()-.5)*8, (Math.random()-.5)*8);
+    ctx.clearRect(-10,-10,W+20,H+20);
+
+    ctx.fillStyle = '#fff';
+    stars.forEach(s => { ctx.globalAlpha = s.s/2.5; ctx.fillRect(s.x, s.y, s.s, s.s); });
+    ctx.globalAlpha = 1;
+
+    powerups.forEach(p => {
+      ctx.fillStyle = '#facc15'; ctx.beginPath(); ctx.arc(p.x, p.y, 11, 0, 7); ctx.fill();
+      ctx.fillStyle = '#713f12'; ctx.font = 'bold 14px sans-serif'; ctx.textAlign = 'center'; ctx.fillText('★', p.x, p.y+5);
+    });
+
+    enemies.forEach(e => {
+      if (e.type === 'ship') drawShip(e.x, e.y, '#f472b6', true);
+      else {
+        ctx.save(); ctx.translate(e.x, e.y); ctx.rotate(e.rot);
+        ctx.fillStyle = '#78716c'; ctx.strokeStyle = '#a8a29e'; ctx.lineWidth = 2;
+        ctx.beginPath();
+        for (let i=0;i<8;i++){ const a = i/8*6.283, r = e.w/2*(i%2?.82:1); ctx.lineTo(Math.cos(a)*r, Math.sin(a)*r); }
+        ctx.closePath(); ctx.fill(); ctx.stroke(); ctx.restore();
+      }
+    });
+
+    bullets.forEach(b => {
+      ctx.fillStyle = b.own ? '#38bdf8' : '#f87171';
+      ctx.fillRect(b.x-2, b.y-7, 4, 14);
+    });
+
+    if (player.inv <= 0 || Math.floor(player.inv*10)%2 === 0) {
+      drawShip(player.x, player.y, player.power > 0 ? '#facc15' : '#38bdf8', false);
+      ctx.fillStyle = '#fb923c';
+      ctx.beginPath(); ctx.moveTo(-5+player.x, player.y+14); ctx.lineTo(player.x, player.y+24+Math.random()*8); ctx.lineTo(5+player.x, player.y+14); ctx.fill();
+    }
+
+    particles.forEach(p => { ctx.globalAlpha = Math.max(0, p.life); ctx.fillStyle = p.c; ctx.fillRect(p.x, p.y, 3, 3); });
+    ctx.globalAlpha = 1;
+
+    ctx.fillStyle = '#94a3b8'; ctx.font = '13px sans-serif'; ctx.textAlign = 'left';
+    ctx.fillText('Lv ' + level, 8, 18);
+    ctx.restore();
+  }
+
+  function loop(t){
+    if (!running) return;
+    const dt = Math.min(.04, (t-last)/1000 || 0); last = t;
+    update(dt); draw();
+    if (running) requestAnimationFrame(loop);
+  }
+
+  function gameOver(){
+    running = false;
+    if (score > best) {
+      best = score; bestEl.textContent = best;
+      try { localStorage.setItem('spaceBest', best); } catch(e) {}
+    }
+    draw();
+    msg.innerHTML = 'গেম ওভার! 💥<br>স্কোর: ' + score + '<br>লেভেল: ' + level;
+    startBtn.textContent = 'আবার খেলো';
+    overlay.style.display = 'flex';
+  }
+
+  function start(){
+    reset(); overlay.style.display = 'none'; running = true; last = performance.now();
+    requestAnimationFrame(loop);
+  }
+
+  function posX(clientX){
+    const r = cv.getBoundingClientRect();
+    return (clientX - r.left) / r.width * W;
+  }
+
+  cv.addEventListener('touchstart', e => { e.preventDefault(); tx = posX(e.touches[0].clientX); }, {passive:false});
+  cv.addEventListener('touchmove', e => { e.preventDefault(); tx = posX(e.touches[0].clientX); }, {passive:false});
+  cv.addEventListener('mousemove', e => { if (running) tx = posX(e.clientX); });
+  window.addEventListener('keydown', e => { keys[e.key] = true; if (e.key.startsWith('Arrow')) { e.preventDefault(); tx = null; } });
+  window.addEventListener('keyup', e => { keys[e.key] = false; });
+  startBtn.onclick = start;
+
+  reset(); draw();
+})();
+</script>
+</body>
+</html>
